@@ -1,0 +1,10 @@
+# BIP39 mnemonics — one per line — derived as EVM addresses (m/44'/60'/0'/0/0).
+# Used by the EVM scan / EVM real modes.
+# Lines starting with # are comments.
+#
+# The wizard creates this file automatically when you paste mnemonics in
+# the EVM-side prompt; you normally don't need to edit it by hand.
+#
+# Sample (BIP39 valid, public test phrases — DO NOT USE on mainnet):
+# abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+# legal winner thank year wave sausage worth useful legal winner thank yellow

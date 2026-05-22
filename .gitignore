@@ -1,0 +1,64 @@
+# ---------------------------------------------------------------------------
+# Build / IDE / OS
+# ---------------------------------------------------------------------------
+node_modules/
+dist/
+*.tsbuildinfo
+*.exe
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+logs/
+*.log
+
+# ---------------------------------------------------------------------------
+# Environment / secrets — NEVER commit these
+# ---------------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+
+# ---------------------------------------------------------------------------
+# User data inside data/. Everything user-specific (seeds, private keys,
+# recipients, funder keys, generated mnemonics) is gitignored. Only
+# *.example files survive into the repo as format references.
+# ---------------------------------------------------------------------------
+
+# Wallets (mnemonics)
+data/seeds.txt
+data/seeds-evm.txt
+data/seeds-sol.txt
+data/seeds-active.txt
+data/seeds-evm-active.txt
+data/seeds-sol-active.txt
+
+# Wallets (raw private keys)
+data/privkeys-evm.txt
+data/privkeys-sol.txt
+
+# Recipients (user-provided lists + wizard-generated wallets with mnemonics)
+data/recipients-evm.txt
+data/recipients-sol.txt
+data/generated-recipients-*.txt
+
+# Funder private keys (rotation lists)
+data/funders-evm.txt
+data/funders-sol.txt
+
+# Per-user custom-token additions (the .example stays in repo)
+data/custom-tokens.json
+
+# ---------------------------------------------------------------------------
+# Local notes / scratch
+# ---------------------------------------------------------------------------
+Новый текстовый документ.txt
+NOTES.md
+TODO.md
+HANDOFF.md

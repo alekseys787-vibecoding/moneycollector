@@ -1,0 +1,8 @@
+# Raw EVM private keys — one per line — used by the EVM modes.
+# 32-byte hex, with or without the 0x prefix. Lines starting with # are comments.
+#
+# The wizard creates this file automatically when you paste private keys in
+# the EVM-side prompt; you normally don't need to edit it by hand.
+#
+# Sample (random demo key — DO NOT USE on mainnet):
+# 0x0000000000000000000000000000000000000000000000000000000000000001

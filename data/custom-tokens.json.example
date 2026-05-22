@@ -1,0 +1,8 @@
+{
+  "_comment": "Optional. Copy to custom-tokens.json and add tokens you want the script to detect on top of the built-in list. Each entry: { address, symbol, decimals }. Address is the ERC20 contract on that chain.",
+  "ethereum": [
+    { "address": "0x0000000000000000000000000000000000000000", "symbol": "EXAMPLE", "decimals": 18 }
+  ],
+  "arbitrum": [],
+  "base": []
+}

@@ -1,0 +1,8 @@
+# Raw Solana secret keys — one per line — used by the Solana modes.
+# Two formats are auto-detected:
+#   1. base58 string (Phantom "Export Private Key" — ~88 chars, no brackets)
+#   2. JSON byte array (Solana CLI keypair files — `[12,34,56,...]`, 64 bytes)
+# Lines starting with # are comments.
+#
+# The wizard creates this file automatically when you paste secrets in the
+# Solana-side prompt; you normally don't need to edit it by hand.

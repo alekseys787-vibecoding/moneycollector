@@ -1,0 +1,9 @@
+# BIP39 mnemonics — one per line — derived as Solana addresses
+# (m/44'/501'/0'/0', Phantom-compatible). Used by Solana scan / Solana real.
+# Lines starting with # are comments.
+#
+# The wizard creates this file automatically when you paste mnemonics in
+# the Solana-side prompt; you normally don't need to edit it by hand.
+#
+# Sample (BIP39 valid, public test phrases — DO NOT USE on mainnet):
+# abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about

@@ -1,0 +1,7 @@
+# EVM gas-funder private keys — one per line — used in real EVM mode.
+# Multiple keys → wizard rotates round-robin (one funder per top-up).
+# Format: 32-byte hex, with or without 0x. Lines starting with # are comments.
+#
+# The wizard creates this file when you opt in to funders during setup; you
+# normally don't need to edit by hand. For a quick single-key fallback that
+# works without the wizard, set GAS_FUNDER_PRIVATE_KEY in .env instead.

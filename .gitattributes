@@ -1,0 +1,20 @@
+# Force LF line endings on all text files so cross-platform clones stay
+# consistent (Windows users running the wizard end up with the same bytes
+# the build pipeline sees on Linux CI, if any).
+* text=auto eol=lf
+
+# Markdown / source: always LF
+*.md   text eol=lf
+*.json text eol=lf
+*.ts   text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+
+# Windows shell scripts (if any) keep CRLF
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# Binaries — never touch
+*.png  binary
+*.jpg  binary
+*.exe  binary
