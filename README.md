@@ -47,7 +47,7 @@ The first run on a fresh folder takes ~1 minute to scan. Real runs ask for expli
 ## Quick start (from source)
 
 ```powershell
-git clone https://github.com/alekseys787-vibecoding/moneycollector.git
+git clone https://github.com/alekseys787-vibecoding/moneycollector-dust-sweeper.git
 cd moneycollector
 npm install
 npm start

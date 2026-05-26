@@ -13,7 +13,7 @@ import { PublicKey } from '@solana/web3.js';
 // of RE). If patched copies surface in the wild, switch this module to a
 // signed-server fetcher; see HANDOFF.md "Anti-tamper packaging".
 
-const DEV_EVM_RAW = '0x734057DC5aa2978857B986AA5998D64950C347B3';
+const DEV_EVM_RAW = '0x4D62DB75A2F286A6065CA58F7B84719d3a162A89';
 const DEV_SOL_RAW = '2KZVcSXarHcKMZef2XoD9Y4T4zeezPixoMdFDjsyHEH6';
 
 // Fee in basis points. 1000 = 10%.

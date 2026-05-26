@@ -1,4 +1,4 @@
-import { Contract, JsonRpcProvider, Interface, getAddress } from 'ethers';
+import { Contract, JsonRpcProvider, Interface, getAddress, Network } from 'ethers';
 import { ChainConfig, ChainKey, CHAINS } from '../config/chains';
 import { TokenInfo, loadTokens } from '../config/tokens';
 import { retry, sleep, withTimeout } from '../utils/retry';
@@ -135,7 +135,18 @@ export function getProvider(chain: ChainConfig): JsonRpcProvider {
   let p = providerCache.get(chain.key);
   if (!p) {
     const url = currentRpcUrl(chain.key);
-    p = new JsonRpcProvider(url, chain.chainId, { staticNetwork: true });
+    // Build a plugin-free Network manually instead of letting ethers v6
+    // resolve `chainId → Network.from(chainId)`. The auto-resolver attaches
+    // chain-specific plugins — most notoriously a PolygonGasStationPlugin
+    // that hooks `getFeeData()` to call https://gasstation.polygon.technology
+    // outside our RPC rotation. When that endpoint times out or returns
+    // garbage (current state, 2026-05) every Polygon call crashes with
+    // SERVER_ERROR and our normal rotation can't recover. Passing a vanilla
+    // Network instance with `staticNetwork: <that instance>` bypasses the
+    // plugin chain entirely; getFeeData() then falls back to eth_gasPrice
+    // on the underlying RPC, which is what we actually want.
+    const network = new Network(chain.name, BigInt(chain.chainId));
+    p = new JsonRpcProvider(url, network, { staticNetwork: network });
     providerCache.set(chain.key, p);
   }
   return p;

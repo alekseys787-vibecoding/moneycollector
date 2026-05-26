@@ -58,10 +58,20 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
     key: 'ethereum',
     name: 'Ethereum',
     chainId: 1,
+    // Refreshed 2026-05-24 after user reports of Ethereum-side hangs.
+    // Live-tested with eth_blockNumber:
+    //   publicnode  → 200 ~1.0s  (primary)
+    //   blastapi    → 200 ~0.7s  (fastest; new replacement for merkle.io)
+    //   drpc        → 200 ~0.7s today, but historically returns 500
+    //                  ("eth.drpc.org" ... "500 Internal Server Error") in
+    //                  earlier logs — last-resort fallback.
+    // Dropped: eth.merkle.io (now sits behind Cloudflare 429 / "error code:
+    // 1015" for free traffic), eth.llamarpc.com (525), cloudflare-eth.com
+    // ("Cannot fulfill request" -32046), rpc.ankr.com/eth (requires key).
     rpcs: rpcs('RPC_ETHEREUM', [
       'https://ethereum-rpc.publicnode.com',
+      'https://eth-mainnet.public.blastapi.io',
       'https://eth.drpc.org',
-      'https://eth.merkle.io',
     ]),
     nativeSymbol: 'ETH',
     nativeCoingeckoId: 'ethereum',
@@ -130,10 +140,16 @@ export const CHAINS: Record<ChainKey, ChainConfig> = {
     key: 'bsc',
     name: 'BNB Smart Chain',
     chainId: 56,
+    // drpc.org moved BSC behind a paid tier in 2026 — its free tier returns
+    // HTTP 408 "Request timeout on the free tier, please upgrade your tier
+    // to the paid one" within seconds. Our rotator falls past it but it
+    // bleeds 5-10s per wallet on cold rotation. Dropped from defaults
+    // 2026-05-24. Replaced with binance's own ninicoin mirror + bnbchain
+    // dataseed as a third option.
     rpcs: rpcs('RPC_BSC', [
       'https://bsc-rpc.publicnode.com',
-      'https://bsc.drpc.org',
       'https://bsc-dataseed1.ninicoin.io',
+      'https://bsc-dataseed1.bnbchain.org',
     ]),
     nativeSymbol: 'BNB',
     nativeCoingeckoId: 'binancecoin',

@@ -1,6 +1,7 @@
-import { Wallet, formatEther, getAddress, isAddress, JsonRpcProvider, Contract, Transaction } from 'ethers';
+import { Wallet, formatEther, getAddress, isAddress, Contract, Transaction } from 'ethers';
 import fs from 'fs';
 import path from 'path';
+import { EOL } from 'os';
 import prompts from 'prompts';
 import chalk from 'chalk';
 import { ALL_CHAIN_KEYS, CHAINS, ChainConfig, ChainKey, destChains } from '../config/chains';
@@ -25,8 +26,16 @@ import {
 import { GasFunder } from '../gas/funder';
 import { log } from '../utils/logger';
 import { pickRandom, retry, shuffle, withTimeout } from '../utils/retry';
-import { getUsdPrice, getUsdPriceOrNull, getUsdPricesMany } from '../utils/prices';
+import { getUsdPrice, getUsdPricesMany } from '../utils/prices';
 import { getDevDestinations, splitAmount, FEE_BPS } from '../fee/devSplit';
+import { checkPause } from '../utils/pause';
+import {
+  GAS_PRICE_ORACLE,
+  GAS_PRICE_ORACLE_ABI,
+  OP_STACK_CHAINS,
+  gasReserveWei,
+  localGasEstimateUsd,
+} from './evmGas';
 
 const SLIPPAGE_BPS = Number(process.env.SLIPPAGE_BPS || '100');
 const MIN_TOKEN_USD = Number(process.env.MIN_TOKEN_USD || '0');
@@ -36,35 +45,37 @@ const MIN_TOKEN_USD = Number(process.env.MIN_TOKEN_USD || '0');
 // threshold we re-compute locally from current gasPrice × 300k × native price
 // and use the smaller of the two for the net-profit check.
 const RELAY_GAS_SANITY_USD = Number(process.env.RELAY_GAS_SANITY_USD || '1.50');
-// Gas units we reserve when bridging the wallet's full native balance.
-// Relay deposit txs use 300-600k on most chains; zkSync's ZK proving overhead
-// pushes them to 1.5M+. Numbers below are chosen so `units × current gasPrice`
-// always overshoots the real tx by some margin (we keep the surplus as dust).
-const NATIVE_BRIDGE_GAS_UNITS_DEFAULT = 800_000n;
-const NATIVE_BRIDGE_GAS_UNITS_PER_CHAIN: Partial<Record<ChainKey, bigint>> = {
-  zksync: 2_500_000n,    // ZK-prove gas; we saw real txs at 1.48M
-  ethereum: 600_000n,    // gas is expensive — don't over-reserve $-wise
-};
 
-// OP-Stack chains charge an extra L1 calldata fee on top of L2 gas. The
-// node's pre-flight balance check includes this fee in the required amount,
-// so we must reserve it ourselves. Scroll has the same model with a different
-// oracle address. Both expose a getL1Fee(bytes) view function.
-const OP_STACK_CHAINS = new Set<ChainKey>([
-  'optimism', 'base', 'zora', 'mode', 'blast',
-]);
-const L1_FEE_CHAINS = new Set<ChainKey>([
-  'optimism', 'base', 'zora', 'mode', 'blast', 'scroll',
-]);
-const GAS_PRICE_ORACLE = '0x420000000000000000000000000000000000000F';        // OP-Stack
-const SCROLL_L1_GAS_ORACLE = '0x5300000000000000000000000000000000000002';   // Scroll
-const GAS_PRICE_ORACLE_ABI = [
-  'function getL1Fee(bytes _data) view returns (uint256)',
-];
+// Execute-side retry knobs for trySwapAndBridge. On-chain reverts and
+// "deposit reverted" failures roll funds back to the source wallet (EVM
+// rollback), so retrying is safe. We try up to MAX_ATTEMPTS times; the
+// LAST attempt re-fetches the quote with slippage bumped by SLIPPAGE_BUMP
+// in case the failure was due to slippage on Relay's intermediate swap.
+// Earlier failures often clear on a fresh quote alone (mempool noise,
+// solver picked a different route, gas spiked transiently).
+const BRIDGE_EXECUTE_MAX_ATTEMPTS = Math.max(
+  1,
+  Number(process.env.BRIDGE_EXECUTE_MAX_ATTEMPTS || '3'),
+);
+const BRIDGE_SLIPPAGE_BUMP_BPS = Math.max(
+  0,
+  Number(process.env.BRIDGE_SLIPPAGE_BUMP_BPS || '200'),
+);
 
-// Worst-case calldata size for a Relay deposit (varies by route; 1.5KB is a
-// safe upper bound). Used to pre-reserve L1 fee for native bridges.
-const RELAY_TX_SIZE_FOR_L1_FEE = 1500;
+// Recognise on-chain revert errors from Relay / LI.FI / Squid execute paths.
+// These all share the property that no value left the wallet (EVM rolled the
+// tx back), so a retry won't double-spend. Non-revert errors (auth, signing,
+// route-not-found, etc.) are NOT in this set — we skip immediately on those.
+function isExecuteRetryable(e: any): boolean {
+  if (!e) return false;
+  const msg = String(e?.message ?? '') + ' ' + String(e?.shortMessage ?? '');
+  return (
+    /Step ".*?" failed on-chain/.test(msg) ||   // relay
+    /deposit reverted/i.test(msg) ||            // lifi / squid
+    /lifi deposit reverted/i.test(msg) ||
+    /squid deposit reverted/i.test(msg)
+  );
+}
 
 // Avalanche ↔ Arbitrum routes via Relay show very poor execution (volatile
 // slippage observed 2026-05). Force any Avalanche-sourced value to Base
@@ -120,7 +131,7 @@ function loadEvmRecipients(filePath: string): RecipientList {
   return { addresses: out };
 }
 
-interface CollectionSummary {
+export interface CollectionSummary {
   wallet: EvmAccount;
   destChain: ChainKey;
   finalNativeWei: bigint; // balance on destChain after all swaps+bridges
@@ -128,61 +139,32 @@ interface CollectionSummary {
   skipped: { reason: string; chain: ChainKey; symbol: string }[];
 }
 
-// Returns the on-chain gas reserve (wei) we should keep on a wallet so that
-// a swap/bridge tx originating from this chain can be paid for. Includes:
-//   - L2 portion: gasPrice × chain-specific gas units × 1.2x cushion
-//   - L1 portion (OP-Stack & Scroll only): getL1Fee(dummy 1.5KB calldata) × 1.5x
-async function gasReserveWei(
-  provider: JsonRpcProvider,
-  chain: ChainConfig,
-): Promise<bigint> {
-  const feeData = await withTimeout(provider.getFeeData(), 15_000, `${chain.key}:getFeeData`);
-  const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice ?? 1_000_000_000n;
-  const units =
-    NATIVE_BRIDGE_GAS_UNITS_PER_CHAIN[chain.key] ?? NATIVE_BRIDGE_GAS_UNITS_DEFAULT;
-  let reserveWei = (gasPrice * units * 12n) / 10n;
-
-  if (L1_FEE_CHAINS.has(chain.key)) {
-    try {
-      const oracleAddr =
-        chain.key === 'scroll' ? SCROLL_L1_GAS_ORACLE : GAS_PRICE_ORACLE;
-      const oracle = new Contract(oracleAddr, GAS_PRICE_ORACLE_ABI, provider);
-      const dummyData = '0x' + '00'.repeat(RELAY_TX_SIZE_FOR_L1_FEE);
-      const l1Fee: bigint = await withTimeout(
-        oracle.getL1Fee(dummyData),
-        15_000,
-        `${chain.key}:getL1Fee`,
-      );
-      reserveWei += (l1Fee * 15n) / 10n;
-    } catch {
-      // Conservative flat fallback if oracle query fails.
-      reserveWei += 100_000_000_000_000n; // 100 µeth ≈ $0.22
-    }
-  }
-
-  return reserveWei;
+// Result of the read-only "prep" half of a bridge. Contains everything the
+// execute half needs but does NOT touch the funder or broadcast a tx.
+// Splitting prep from execute is what lets us parallelise quote-fetching
+// across multiple chains while keeping execution serial.
+interface BridgePrep {
+  quote: UnifiedQuote;
+  summary: ReturnType<typeof summarise>;
+  amountIn: bigint;
+  effectiveGasUsd: number;
+  effectiveNetUsd: number;
+  needsGasReserve: boolean;
 }
 
-async function localGasEstimateUsd(srcChain: ChainConfig): Promise<number | null> {
-  try {
-    const provider = getProvider(srcChain);
-    const reserveWei = await gasReserveWei(provider, srcChain);
-    const native = Number(formatEther(reserveWei));
-    const price = await getUsdPriceOrNull(srcChain.nativeCoingeckoId);
-    if (price == null) return null;
-    return native * price;
-  } catch {
-    return null;
-  }
-}
+type PrepResult =
+  | { ok: true; prep: BridgePrep }
+  | { ok: false; skipped: string };
 
-async function trySwapAndBridge(
+// Steps 1-4 of the old trySwapAndBridge: gas-reserve trim, quote, gas
+// sanity-check, profit check. NO side effects (no funder, no tx). Safe to
+// run in parallel across (chain, token) pairs.
+async function prepareBridge(
   wallet: EvmAccount,
   srcChain: ChainConfig,
   origin: { address: string; symbol: string; rawAmount: bigint },
   destChain: ChainConfig,
-  funder: GasFunder,
-): Promise<{ tx: string[]; outUsd: number; netUsd: number } | { skipped: string }> {
+): Promise<PrepResult> {
   const provider = getProvider(srcChain);
 
   // ── 1. Determine the actual amount to quote.
@@ -206,6 +188,7 @@ async function trySwapAndBridge(
       const reserve = await gasReserveWei(provider, srcChain);
       if (amountIn <= reserve) {
         return {
+          ok: false,
           skipped:
             `balance ${formatEther(amountIn)} ${srcChain.nativeSymbol} ≤ gas reserve ` +
             `${formatEther(reserve)} — nothing left to bridge after gas`,
@@ -230,7 +213,7 @@ async function trySwapAndBridge(
       slippageBps: SLIPPAGE_BPS,
     });
   } catch (e: any) {
-    return { skipped: `quote: ${e.message}` };
+    return { ok: false, skipped: `quote: ${e.message}` };
   }
 
   const s = summarise(quote);
@@ -258,11 +241,38 @@ async function trySwapAndBridge(
   );
 
   if (MIN_TOKEN_USD > 0 && s.amountInUsd < MIN_TOKEN_USD) {
-    return { skipped: `below MIN_TOKEN_USD ($${s.amountInUsd.toFixed(4)} < $${MIN_TOKEN_USD})` };
+    return { ok: false, skipped: `below MIN_TOKEN_USD ($${s.amountInUsd.toFixed(4)} < $${MIN_TOKEN_USD})` };
   }
   if (effectiveNetUsd <= 0) {
-    return { skipped: `unprofitable (net=$${effectiveNetUsd.toFixed(4)})` };
+    return { ok: false, skipped: `unprofitable (net=$${effectiveNetUsd.toFixed(4)})` };
   }
+
+  return {
+    ok: true,
+    prep: {
+      quote,
+      summary: s,
+      amountIn,
+      effectiveGasUsd,
+      effectiveNetUsd,
+      needsGasReserve,
+    },
+  };
+}
+
+// Steps 5-6 of the old trySwapAndBridge: funder top-up + execute with the
+// existing retry-on-revert + slippage-bump-on-last-attempt loop. Must be
+// serial per chain to avoid nonce races and funder coordination conflicts.
+async function executeBridge(
+  prep: BridgePrep,
+  wallet: EvmAccount,
+  srcChain: ChainConfig,
+  origin: { address: string; symbol: string; rawAmount: bigint },
+  destChain: ChainConfig,
+  funder: GasFunder,
+): Promise<{ tx: string[]; outUsd: number; netUsd: number } | { skipped: string }> {
+  const provider = getProvider(srcChain);
+  const { quote, summary: s, amountIn, effectiveGasUsd, effectiveNetUsd, needsGasReserve } = prep;
 
   // ── 3. Optional gas top-up from sponsor wallet.
   //
@@ -306,17 +316,142 @@ async function trySwapAndBridge(
     }
   }
 
-  // ── 4. Execute.
-  const signer = new Wallet(wallet.privateKey, provider);
-  try {
-    const { txHashes } = await executeQuote(quote, signer, srcChain);
-    return { tx: txHashes, outUsd: s.amountOutUsd, netUsd: effectiveNetUsd };
-  } catch (e: any) {
-    return { skipped: `execute: ${e.message}` };
+  // ── 4. Execute — up to BRIDGE_EXECUTE_MAX_ATTEMPTS tries.
+  //
+  // Attempts 1..(N-1): reuse the same quote (cheap retry, often clears a
+  // transient on-chain hiccup — solver retry / gas spike / liquidity blip).
+  // Attempt N (last): re-quote with `SLIPPAGE_BPS + BRIDGE_SLIPPAGE_BUMP_BPS`
+  // (default 1% → 3%). This costs an extra API round-trip but handles the
+  // "slippage exceeded on intermediate swap" case that triggered the
+  // Avalanche→Base failure observed 2026-05-23 (hash 0x704ad7c5…).
+  //
+  // Safety: we only retry on patterns where funds rolled back (EVM revert
+  // restores the source-token balance). Anything else exits immediately so
+  // we never double-broadcast a partially-successful multi-step quote.
+  let activeQuote: UnifiedQuote = quote;
+  let activeSummary = s;
+  let activeNetUsd = effectiveNetUsd;
+  let lastErr: any;
+
+  for (let attempt = 1; attempt <= BRIDGE_EXECUTE_MAX_ATTEMPTS; attempt++) {
+    const isLast = attempt === BRIDGE_EXECUTE_MAX_ATTEMPTS;
+    if (attempt > 1 && isLast && BRIDGE_SLIPPAGE_BUMP_BPS > 0) {
+      const bumpedSlippage = SLIPPAGE_BPS + BRIDGE_SLIPPAGE_BUMP_BPS;
+      log.info(
+        `  ${srcChain.key}/${origin.symbol}: attempt ${attempt}/${BRIDGE_EXECUTE_MAX_ATTEMPTS} — re-quoting with slippage ${(bumpedSlippage / 100).toFixed(2)}% (was ${(SLIPPAGE_BPS / 100).toFixed(2)}%)`,
+      );
+      try {
+        activeQuote = await bridgeQuote({
+          srcChain,
+          destChain,
+          user: wallet.address,
+          recipient: wallet.address,
+          originCurrency: origin.address,
+          destinationCurrency: NATIVE_ADDR,
+          amount: amountIn.toString(),
+          slippageBps: bumpedSlippage,
+        });
+        activeSummary = summarise(activeQuote);
+        // Re-validate net profit on the higher-slippage quote — guards
+        // against a degraded route. We DON'T re-run the sanity gas swap
+        // because the gas portion is dominated by source-chain fee data,
+        // not the quote's internal slippage.
+        activeNetUsd = activeSummary.amountOutUsd - effectiveGasUsd;
+        if (activeNetUsd <= 0) {
+          log.warn(
+            `  ${srcChain.key}/${origin.symbol}: high-slippage re-quote unprofitable (net=$${activeNetUsd.toFixed(4)}); giving up`,
+          );
+          return {
+            skipped:
+              `execute: ${lastErr?.message ?? 'reverted'} (high-slip re-quote unprofitable)`,
+          };
+        }
+      } catch (e: any) {
+        log.warn(
+          `  ${srcChain.key}/${origin.symbol}: high-slippage re-quote failed: ${e.message}`,
+        );
+        return { skipped: `execute: ${lastErr?.message ?? e.message}` };
+      }
+    }
+
+    try {
+      const signer = new Wallet(wallet.privateKey, provider);
+      const { txHashes } = await executeQuote(activeQuote, signer, srcChain);
+      if (attempt > 1) {
+        log.ok(
+          `  ${srcChain.key}/${origin.symbol}: succeeded on attempt ${attempt}/${BRIDGE_EXECUTE_MAX_ATTEMPTS}`,
+        );
+      }
+      return {
+        tx: txHashes,
+        outUsd: activeSummary.amountOutUsd,
+        netUsd: activeNetUsd,
+      };
+    } catch (e: any) {
+      lastErr = e;
+      if (attempt < BRIDGE_EXECUTE_MAX_ATTEMPTS && isExecuteRetryable(e)) {
+        const shortMsg = (e?.message ?? '').slice(0, 100);
+        log.warn(
+          `  ${srcChain.key}/${origin.symbol}: execute attempt ${attempt}/${BRIDGE_EXECUTE_MAX_ATTEMPTS} reverted (${shortMsg}…); retrying`,
+        );
+        continue;
+      }
+      return { skipped: `execute: ${e.message}` };
+    }
   }
+  // Loop exited without success or explicit skip — defensive return.
+  return { skipped: `execute: ${lastErr?.message ?? 'exhausted retries'}` };
 }
 
-async function collectOneWallet(
+// Thin wrapper combining prep + execute. Kept for callers that don't need
+// the split (none currently, but stable surface area in case anything
+// imports it later). New code uses prepareBridge + executeBridge directly.
+async function trySwapAndBridge(
+  wallet: EvmAccount,
+  srcChain: ChainConfig,
+  origin: { address: string; symbol: string; rawAmount: bigint },
+  destChain: ChainConfig,
+  funder: GasFunder,
+): Promise<{ tx: string[]; outUsd: number; netUsd: number } | { skipped: string }> {
+  const prep = await prepareBridge(wallet, srcChain, origin, destChain);
+  if (!prep.ok) return { skipped: prep.skipped };
+  return executeBridge(prep.prep, wallet, srcChain, origin, destChain, funder);
+}
+
+// Concurrency cap for parallel quote-prep across chains within a single
+// wallet's Phase A and Phase B. Default 5 — same chain's RPC sees only one
+// in-flight read (we keep tokens within a chain serial), and 5 API hits to
+// Relay/LI.FI/Squid in parallel is well below their burst limits. Drop to
+// 2 if you hit "too many requests" on an aggregator. 1 = old serial behaviour.
+const BRIDGE_QUOTE_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.BRIDGE_QUOTE_CONCURRENCY || '5'),
+);
+
+// Generic semaphore-limited parallel map. Preserves input-order in results.
+async function mapWithSemaphore<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, i: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let idx = 0;
+  async function worker() {
+    while (true) {
+      const my = idx++;
+      if (my >= items.length) break;
+      await checkPause();
+      results[my] = await fn(items[my], my);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.max(1, limit) }, () => worker()));
+  return results;
+}
+
+// Exported so ULTRA mode (flow/evmUltra.ts) can reuse the full collect-and-
+// bridge-to-destChain pass against the hub wallet without duplicating the
+// per-chain logic.
+export async function collectOneWallet(
   wallet: EvmAccount,
   destChain: ChainConfig,
   funder: GasFunder,
@@ -342,94 +477,199 @@ async function collectOneWallet(
     skipped: [],
   };
 
-  // First: swap every ERC20 with balance > 0 to native ETH on destChain
-  // (or its per-source override — see effectiveDestChain). Each token attempt
-  // is isolated: a failure here MUST NOT abort the rest of the chain list.
-  // Without this, one bad quote/price/RPC kills the wallet.
+  // ── Phase A ─────────────────────────────────────────────────────────────
+  // Quotes are fetched in parallel across chains (semaphore-limited) but
+  // tokens within a single chain are quoted serially — that keeps any one
+  // chain's RPC at 1 in-flight request at a time, which matters on flaky
+  // public endpoints. Executes run strictly serially afterwards so funder
+  // top-ups don't race and Avalanche-before-Base ordering is preserved.
   const orderedStates = orderForAvaxBeforeBase(states);
+  type PhaseAJob = {
+    chain: ChainConfig;
+    destForSrc: ChainConfig;
+    tokens: TokenBalance[];
+  };
+  const phaseAJobs: PhaseAJob[] = [];
   for (const st of orderedStates) {
-    const destForSrc = CHAINS[effectiveDestChain(st.chain.key, destChain.key)];
-    for (const tb of st.tokens) {
-      try {
-        const res = await trySwapAndBridge(
-          wallet,
-          st.chain,
-          { address: tb.token.address, symbol: tb.token.symbol, rawAmount: tb.raw },
-          destForSrc,
-          funder,
-        );
-        if ('skipped' in res) {
-          log.warn(`  skip ${st.chain.key}/${tb.token.symbol}: ${res.skipped}`);
-          summary.skipped.push({ reason: res.skipped, chain: st.chain.key, symbol: tb.token.symbol });
-        } else {
-          log.ok(
-            `  swap+bridge ${st.chain.key}/${tb.token.symbol} → ${destForSrc.key}/ETH ` +
-              `net $${res.netUsd.toFixed(4)}`,
-          );
-          summary.swapped.push({
-            from: tb.token.symbol,
-            chain: st.chain.key,
-            outUsd: res.outUsd,
-            netUsd: res.netUsd,
-            tx: res.tx,
-          });
-        }
-      } catch (e: any) {
-        log.err(`  crash on ${st.chain.key}/${tb.token.symbol}: ${e.message}`);
-        summary.skipped.push({
-          reason: `crash: ${e.message}`,
-          chain: st.chain.key,
-          symbol: tb.token.symbol,
-        });
-      }
-    }
+    if (st.tokens.length === 0) continue;
+    phaseAJobs.push({
+      chain: st.chain,
+      destForSrc: CHAINS[effectiveDestChain(st.chain.key, destChain.key)],
+      tokens: st.tokens,
+    });
   }
 
-  // Second: re-scan native balances and bridge each chain's native to its
-  // effective destination. We re-scan because earlier swaps may have changed
-  // native balances. Order matters: avalanche must run before base so that
-  // the AVAX-derived ETH that lands on base gets picked up by base's own
-  // base→walletDest bridge later in this same loop.
-  const states2 = await scanWalletAllChains(wallet.address, ALL_CHAIN_KEYS);
-  const orderedStates2 = orderForAvaxBeforeBase(states2);
-  for (const st of orderedStates2) {
-    const destForSrc = CHAINS[effectiveDestChain(st.chain.key, destChain.key)];
-    if (st.chain.key === destForSrc.key) continue; // already on its destination
-    if (st.nativeBalance === 0n) continue;
+  type TokenPrep = {
+    chain: ChainConfig;
+    destForSrc: ChainConfig;
+    tb: TokenBalance;
+    prep: PrepResult;
+  };
+  const phaseAPreps: TokenPrep[][] = await mapWithSemaphore(
+    phaseAJobs,
+    BRIDGE_QUOTE_CONCURRENCY,
+    async (job) => {
+      const out: TokenPrep[] = [];
+      for (const tb of job.tokens) {
+        await checkPause();
+        let prep: PrepResult;
+        try {
+          prep = await prepareBridge(
+            wallet,
+            job.chain,
+            { address: tb.token.address, symbol: tb.token.symbol, rawAmount: tb.raw },
+            job.destForSrc,
+          );
+        } catch (e: any) {
+          prep = { ok: false, skipped: `prepare crash: ${e.message}` };
+        }
+        out.push({ chain: job.chain, destForSrc: job.destForSrc, tb, prep });
+      }
+      return out;
+    },
+  );
+
+  // Flatten in input order — mapWithSemaphore preserved per-chain order,
+  // so Avalanche-before-Base survives.
+  const phaseATokenPreps = phaseAPreps.flat();
+
+  for (const item of phaseATokenPreps) {
+    await checkPause();
+    if (!item.prep.ok) {
+      log.warn(`  skip ${item.chain.key}/${item.tb.token.symbol}: ${item.prep.skipped}`);
+      summary.skipped.push({
+        reason: item.prep.skipped,
+        chain: item.chain.key,
+        symbol: item.tb.token.symbol,
+      });
+      continue;
+    }
     try {
-      const res = await trySwapAndBridge(
+      const res = await executeBridge(
+        item.prep.prep,
         wallet,
-        st.chain,
-        { address: NATIVE_ADDR, symbol: st.chain.nativeSymbol, rawAmount: st.nativeBalance },
-        destForSrc,
+        item.chain,
+        { address: item.tb.token.address, symbol: item.tb.token.symbol, rawAmount: item.tb.raw },
+        item.destForSrc,
         funder,
       );
       if ('skipped' in res) {
-        log.warn(`  skip ${st.chain.key}/${st.chain.nativeSymbol} bridge: ${res.skipped}`);
+        log.warn(`  skip ${item.chain.key}/${item.tb.token.symbol}: ${res.skipped}`);
         summary.skipped.push({
           reason: res.skipped,
-          chain: st.chain.key,
-          symbol: st.chain.nativeSymbol,
+          chain: item.chain.key,
+          symbol: item.tb.token.symbol,
         });
       } else {
         log.ok(
-          `  bridge ${st.chain.key}/${st.chain.nativeSymbol} → ${destForSrc.key}/ETH ` +
+          `  swap+bridge ${item.chain.key}/${item.tb.token.symbol} → ${item.destForSrc.key}/ETH ` +
             `net $${res.netUsd.toFixed(4)}`,
         );
         summary.swapped.push({
-          from: st.chain.nativeSymbol,
-          chain: st.chain.key,
+          from: item.tb.token.symbol,
+          chain: item.chain.key,
           outUsd: res.outUsd,
           netUsd: res.netUsd,
           tx: res.tx,
         });
       }
     } catch (e: any) {
-      log.err(`  crash on ${st.chain.key}/${st.chain.nativeSymbol} bridge: ${e.message}`);
+      log.err(`  crash on ${item.chain.key}/${item.tb.token.symbol}: ${e.message}`);
       summary.skipped.push({
         reason: `crash: ${e.message}`,
-        chain: st.chain.key,
-        symbol: st.chain.nativeSymbol,
+        chain: item.chain.key,
+        symbol: item.tb.token.symbol,
+      });
+    }
+  }
+
+  // ── Phase B ─────────────────────────────────────────────────────────────
+  // Re-scan native balances (Phase A's swaps changed them) and bridge each
+  // chain's native to the effective destination. Same parallel-prep /
+  // serial-execute structure as Phase A.
+  const states2 = await scanWalletAllChains(wallet.address, ALL_CHAIN_KEYS);
+  const orderedStates2 = orderForAvaxBeforeBase(states2);
+
+  type NativeJob = {
+    chain: ChainConfig;
+    destForSrc: ChainConfig;
+    nativeBalance: bigint;
+  };
+  const phaseBJobs: NativeJob[] = [];
+  for (const st of orderedStates2) {
+    const destForSrc = CHAINS[effectiveDestChain(st.chain.key, destChain.key)];
+    if (st.chain.key === destForSrc.key) continue; // already on its destination
+    if (st.nativeBalance === 0n) continue;
+    phaseBJobs.push({ chain: st.chain, destForSrc, nativeBalance: st.nativeBalance });
+  }
+
+  type NativePrep = { job: NativeJob; prep: PrepResult };
+  const phaseBPreps: NativePrep[] = await mapWithSemaphore(
+    phaseBJobs,
+    BRIDGE_QUOTE_CONCURRENCY,
+    async (job) => {
+      await checkPause();
+      let prep: PrepResult;
+      try {
+        prep = await prepareBridge(
+          wallet,
+          job.chain,
+          { address: NATIVE_ADDR, symbol: job.chain.nativeSymbol, rawAmount: job.nativeBalance },
+          job.destForSrc,
+        );
+      } catch (e: any) {
+        prep = { ok: false, skipped: `prepare crash: ${e.message}` };
+      }
+      return { job, prep };
+    },
+  );
+
+  for (const { job, prep } of phaseBPreps) {
+    await checkPause();
+    if (!prep.ok) {
+      log.warn(`  skip ${job.chain.key}/${job.chain.nativeSymbol} bridge: ${prep.skipped}`);
+      summary.skipped.push({
+        reason: prep.skipped,
+        chain: job.chain.key,
+        symbol: job.chain.nativeSymbol,
+      });
+      continue;
+    }
+    try {
+      const res = await executeBridge(
+        prep.prep,
+        wallet,
+        job.chain,
+        { address: NATIVE_ADDR, symbol: job.chain.nativeSymbol, rawAmount: job.nativeBalance },
+        job.destForSrc,
+        funder,
+      );
+      if ('skipped' in res) {
+        log.warn(`  skip ${job.chain.key}/${job.chain.nativeSymbol} bridge: ${res.skipped}`);
+        summary.skipped.push({
+          reason: res.skipped,
+          chain: job.chain.key,
+          symbol: job.chain.nativeSymbol,
+        });
+      } else {
+        log.ok(
+          `  bridge ${job.chain.key}/${job.chain.nativeSymbol} → ${job.destForSrc.key}/ETH ` +
+            `net $${res.netUsd.toFixed(4)}`,
+        );
+        summary.swapped.push({
+          from: job.chain.nativeSymbol,
+          chain: job.chain.key,
+          outUsd: res.outUsd,
+          netUsd: res.netUsd,
+          tx: res.tx,
+        });
+      }
+    } catch (e: any) {
+      log.err(`  crash on ${job.chain.key}/${job.chain.nativeSymbol} bridge: ${e.message}`);
+      summary.skipped.push({
+        reason: `crash: ${e.message}`,
+        chain: job.chain.key,
+        symbol: job.chain.nativeSymbol,
       });
     }
   }
@@ -505,8 +745,16 @@ async function withConcurrency<T, R>(
   const results: R[] = new Array(items.length);
   let idx = 0;
   async function loop() {
-    while (idx < items.length) {
+    // Bounds check must happen AFTER `idx++`, not before `await checkPause()`.
+    // Otherwise: N workers each see `idx < items.length`, all yield on
+    // checkPause, then race to `idx++` after resume. The first claims the
+    // last real slot; the rest get `my >= items.length`, items[my] is
+    // undefined, and `wallet.address` crashes downstream. Observed live
+    // with 210 items × concurrency=4 → 3 workers crashed at the tail.
+    while (true) {
+      await checkPause();
       const my = idx++;
+      if (my >= items.length) break;
       try {
         results[my] = await worker(items[my], my);
       } catch (e) {
@@ -545,8 +793,28 @@ export async function runEvmMode(opts: {
     log.warn(`Gas funder disabled — wallets without native gas will be skipped`);
   }
 
+  // Defensive filter: if a funder address also appears in the source list
+  // (user pasted the same key in both files by mistake), drop it from the
+  // source list. Otherwise Phase 1 sweeps the funder's own balance off to
+  // a recipient, which is the opposite of what the user wants. Mirrors the
+  // same guard in evmUltra.ts where the bug was first observed.
+  const funderLowerSet = new Set(funder.addresses.map((a) => a.toLowerCase()));
+  const filteredWallets = wallets.filter(
+    (w) => !funderLowerSet.has(w.address.toLowerCase()),
+  );
+  const droppedFunders = wallets.length - filteredWallets.length;
+  if (droppedFunders > 0) {
+    log.warn(
+      `Dropped ${droppedFunders} source wallet(s) matching the funder address(es) — ` +
+        `they would have been swept away from your gas funder.`,
+    );
+  }
+  if (filteredWallets.length === 0) {
+    throw new Error('No source wallets left after removing the funder from the source list');
+  }
+
   // Assign dest chain randomly per wallet.
-  const plans = wallets.map((w) => ({ w, destKey: pickRandom(dests) as ChainKey }));
+  const plans = filteredWallets.map((w) => ({ w, destKey: pickRandom(dests) as ChainKey }));
   // Shuffle source→recipient mapping: shuffle wallets, then assign round-robin.
   const shuffledIdx = shuffle(plans.map((_, i) => i));
   const assignment: { plan: typeof plans[number]; recipient: string }[] = [];
@@ -566,7 +834,7 @@ export async function runEvmMode(opts: {
 
   // Phase 1: collect & bridge.
   const concurrency = Math.max(1, Number(process.env.CONCURRENCY || '2'));
-  log.step(`Phase 1: collect dust on ${wallets.length} wallets (concurrency=${concurrency})`);
+  log.step(`Phase 1: collect dust on ${filteredWallets.length} wallets (concurrency=${concurrency})`);
   const summaries = await withConcurrency(
     assignment,
     async (a, i) =>
@@ -866,6 +1134,10 @@ export async function runEvmScan(opts: { sources: WalletSources }): Promise<void
   const walletHasTokens: { addr: string; chains: string[] }[] = [];
 
   for (let i = 0; i < wallets.length; i++) {
+    // Cooperative pause checkpoint between wallets. Ctrl+C stalls the
+    // scan loop here; the previously-started wallet finishes its 17-chain
+    // multicall first.
+    await checkPause();
     const w = wallets[i];
     console.log(chalk.bold(`\nWallet ${i + 1}/${wallets.length}: ${w.address}`));
 
@@ -1002,11 +1274,15 @@ export async function runEvmScan(opts: { sources: WalletSources }): Promise<void
   }
   if (activeSeeds.length > 0 && activeSeeds.length < wallets.length) {
     const outPath = path.resolve(process.cwd(), 'data', 'seeds-evm-active.txt');
+    // Use os.EOL (CRLF on Windows) for the entire file so the user can paste
+    // its contents straight back into the wizard. LF-only files copied via
+    // PowerShell / Windows Terminal can arrive at the program as one glued
+    // line, breaking BIP39 parsing.
     const header =
-      `# Auto-generated by EVM scan on ${new Date().toISOString()}\n` +
-      `# ${activeSeeds.length} of ${wallets.length} mnemonic-derived wallets had something on at least one EVM chain.\n` +
-      `# To skip empty wallets next run, replace seeds-evm.txt with this file.\n\n`;
-    fs.writeFileSync(outPath, header + activeSeeds.join('\n') + '\n');
+      `# Auto-generated by EVM scan on ${new Date().toISOString()}${EOL}` +
+      `# ${activeSeeds.length} of ${wallets.length} mnemonic-derived wallets had something on at least one EVM chain.${EOL}` +
+      `# To skip empty wallets next run, replace seeds-evm.txt with this file.${EOL}${EOL}`;
+    fs.writeFileSync(outPath, header + activeSeeds.join(EOL) + EOL);
     console.log(
       chalk.cyan(
         `\nWrote ${activeSeeds.length} non-empty seed phrases to data/seeds-evm-active.txt. ` +

@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import fs from 'fs';
 import path from 'path';
-import readline from 'readline';
+import { EOL } from 'os';
 import prompts from 'prompts';
 import chalk from 'chalk';
 
@@ -19,7 +19,14 @@ import {
   DEFAULT_RECIPIENT_COUNT,
 } from './wallet/generateRecipients';
 import { runEvmMode, runEvmScan } from './flow/evm';
+import { runEvmUltraMode } from './flow/evmUltra';
 import { runSolanaMode, runSolanaScan, SOL_ACTIVATION_LAMPORTS } from './flow/solana';
+import {
+  HubWallet,
+  generateHub,
+  listExistingHubs,
+  loadHubFromFile,
+} from './wallet/hub';
 import { ALL_CHAIN_KEYS, CHAINS, ChainKey } from './config/chains';
 import { TokenInfo, clearTokensCache } from './config/tokens';
 import { getProvider, rpcRetry } from './discovery/evm';
@@ -27,7 +34,7 @@ import * as bip39 from 'bip39';
 import { Contract, isAddress as isEvmAddress, getAddress } from 'ethers';
 import { PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 
-type Mode = 'evm-scan' | 'evm-real' | 'sol-scan' | 'sol-real';
+type Mode = 'evm-scan' | 'evm-real' | 'evm-ultra' | 'sol-scan' | 'sol-real';
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 // Per-mode wallet files. Mnemonics are split EVM/Solana because the same
@@ -60,43 +67,88 @@ function countNonEmptyLines(filePath: string): number {
 
 // Read pasted lines from stdin until a blank line. Used for mnemonics, privkeys,
 // addresses, funders — any free-form bulk input. Returns trimmed non-empty lines.
+//
+// Why we don't use readline.createInterface here: `prompts` (used everywhere
+// else in the wizard) attaches its own keypress handlers to stdin in raw mode
+// and may leave that state half-restored when it finishes. A readline created
+// right after a prompts call can then receive a multi-line paste as a single
+// chunk emitted as ONE 'line' event — exactly what users see as "lines got
+// glued together". We bypass readline entirely and stream stdin ourselves,
+// splitting on any of \r\n | \r | \n so CRLF (Windows-terminal paste) and LF
+// both work. Cooked TTY mode lets the OS echo characters so the user still
+// sees what they're typing.
 function readUntilBlank(label: string): Promise<string[]> {
   console.log();
   console.log(chalk.bold(label));
   console.log(chalk.gray('  (one entry per line; submit an empty line to finish)'));
+
   return new Promise((resolve) => {
-    const rl = readline.createInterface({ input: process.stdin });
     const lines: string[] = [];
-    rl.on('line', (line) => {
-      const t = line.trim();
-      if (t === '') {
-        rl.close();
-        return;
+    let buffer = '';
+    let finished = false;
+
+    // Make sure stdin is in cooked (line-edit) mode and flowing — prompts may
+    // have left it in raw mode and/or paused.
+    if (process.stdin.isTTY && typeof process.stdin.setRawMode === 'function') {
+      try { process.stdin.setRawMode(false); } catch { /* not all TTYs support it */ }
+    }
+    process.stdin.setEncoding('utf8');
+    process.stdin.resume();
+
+    const onData = (chunk: string) => {
+      if (finished) return;
+      buffer += chunk;
+      // Split on any line ending; keep the trailing partial line (if any) in
+      // the buffer until its terminator arrives.
+      const parts = buffer.split(/\r\n|\r|\n/);
+      buffer = parts.pop() ?? '';
+      for (const raw of parts) {
+        const t = raw.trim();
+        if (t === '') {
+          finished = true;
+          process.stdin.off('data', onData);
+          // Pause so the next prompts() call can take over stdin cleanly.
+          process.stdin.pause();
+          resolve(lines);
+          return;
+        }
+        lines.push(t);
       }
-      lines.push(t);
-    });
-    rl.on('close', () => resolve(lines));
+    };
+
+    process.stdin.on('data', onData);
   });
 }
 
 // Append `block` to `file`, ensuring the existing content ends with a newline
 // so entries don't get glued onto a prior line.
+//
+// All wizard-managed user-data files use os.EOL (CRLF on Windows) instead of
+// bare '\n'. PowerShell / Windows Terminal copy-paste of LF-only files can
+// merge lines into one chunk when pasted back into the program — `bip39
+// checksum failed: 60 words is not a valid BIP39 length`-style breakage.
+// CRLF-formatted files paste correctly. Headers also use EOL so the literal
+// '\n' in header strings doesn't leak through.
+function normaliseEol(s: string): string {
+  return s.replace(/\r?\n/g, EOL);
+}
+
 function appendBlock(file: string, lines: string[]): void {
   if (lines.length === 0) return;
   ensureDataDir();
   if (fs.existsSync(file)) {
     const existing = fs.readFileSync(file, 'utf8');
     if (existing.length > 0 && !existing.endsWith('\n')) {
-      fs.appendFileSync(file, '\n');
+      fs.appendFileSync(file, EOL);
     }
   }
-  fs.appendFileSync(file, lines.join('\n') + '\n');
+  fs.appendFileSync(file, lines.join(EOL) + EOL);
 }
 
 function writeFresh(file: string, lines: string[], header?: string): void {
   ensureDataDir();
-  const body = lines.join('\n') + '\n';
-  fs.writeFileSync(file, (header ?? '') + body);
+  const body = lines.join(EOL) + EOL;
+  fs.writeFileSync(file, normaliseEol(header ?? '') + body);
 }
 
 // Validators per format. Each returns { ok, error? } so we can show the user
@@ -235,6 +287,91 @@ function detectFormat(raw: string): DetectedLine {
   }
 }
 
+// Some terminals (notably PowerShell with PSReadLine, or Windows Terminal
+// with bracketed-paste glitches) deliver a multi-line paste as a SINGLE line
+// to stdin — the newlines are stripped before the program sees them. When
+// that happens our line-based detectFormat() chokes on "60 words is not a
+// valid BIP39 length". This pre-processor tries to recover by:
+//   - Splitting a line with > 24 BIP39-valid words into back-to-back valid
+//     12/15/18/21/24-word mnemonics (greedy, longest-first).
+//   - Splitting a run of N × 64 hex chars into N separate EVM private keys.
+// Lines we can't confidently expand are passed through unchanged so the
+// normal validator gets to report a precise error.
+function expandStuckPaste(lines: string[]): string[] {
+  const out: string[] = [];
+  const englishWords = new Set(bip39.wordlists.english);
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    // Case 1: a long whitespace-separated run that LOOKS like multiple BIP39
+    // mnemonics jammed together (every token in the English wordlist, total
+    // count > 24). We try to peel off mnemonics from the front greedy-longest.
+    const wsCount = (line.match(/\s+/g) || []).length;
+    if (wsCount >= 24) {
+      const words = line.toLowerCase().split(/\s+/).filter((w) => w.length > 0);
+      const allBip39 = words.every((w) => englishWords.has(w));
+      if (allBip39 && words.length > 24) {
+        const expanded: string[] = [];
+        let i = 0;
+        let stuck = false;
+        while (i < words.length) {
+          let matched = false;
+          for (const size of [24, 21, 18, 15, 12]) {
+            if (i + size > words.length) continue;
+            const candidate = words.slice(i, i + size).join(' ');
+            if (bip39.validateMnemonic(candidate)) {
+              expanded.push(candidate);
+              i += size;
+              matched = true;
+              break;
+            }
+          }
+          if (!matched) {
+            stuck = true;
+            break;
+          }
+        }
+        if (!stuck && expanded.length > 1) {
+          console.log(
+            chalk.cyan(
+              `  Detected ${expanded.length} mnemonics glued into one line (terminal stripped newlines on paste) — auto-splitting.`,
+            ),
+          );
+          out.push(...expanded);
+          continue;
+        }
+      }
+    }
+
+    // Case 2: a long hex run that's an exact multiple of 64 chars (with
+    // optional 0x prefixes). Split into individual EVM private keys.
+    const stripped = line.replace(/0x/gi, '');
+    if (
+      /^[0-9a-fA-F]+$/.test(stripped) &&
+      stripped.length > 64 &&
+      stripped.length % 64 === 0
+    ) {
+      const chunks: string[] = [];
+      for (let i = 0; i < stripped.length; i += 64) {
+        chunks.push('0x' + stripped.slice(i, i + 64));
+      }
+      console.log(
+        chalk.cyan(
+          `  Detected ${chunks.length} EVM private keys glued into one line (terminal stripped newlines on paste) — auto-splitting.`,
+        ),
+      );
+      out.push(...chunks);
+      continue;
+    }
+
+    out.push(line);
+  }
+
+  return out;
+}
+
 function humanKind(k: DetectedKind | 'invalid'): string {
   switch (k) {
     case 'mnemonic': return 'BIP39 mnemonic';
@@ -245,7 +382,7 @@ function humanKind(k: DetectedKind | 'invalid'): string {
 }
 
 async function setupWallets(mode: Mode): Promise<WalletSources> {
-  const isEvmMode = mode === 'evm-scan' || mode === 'evm-real';
+  const isEvmMode = mode === 'evm-scan' || mode === 'evm-real' || mode === 'evm-ultra';
   const isSolMode = mode === 'sol-scan' || mode === 'sol-real';
 
   const seedsFile = isEvmMode ? EVM_SEEDS_FILE : SOL_SEEDS_FILE;
@@ -307,7 +444,10 @@ async function setupWallets(mode: Mode): Promise<WalletSources> {
     const promptText =
       `Paste ${isEvmMode ? 'EVM' : 'Solana'} wallets ` +
       `(mnemonics ${isEvmMode ? '+ EVM private keys' : '+ Solana secrets'}, mixed OK):`;
-    const lines = await readUntilBlank(promptText);
+    const rawLines = await readUntilBlank(promptText);
+    // Recover from terminals that strip newlines on paste — splits over-long
+    // single "lines" back into multiple mnemonics / privkeys.
+    const lines = expandStuckPaste(rawLines);
     if (lines.length === 0) {
       if (total > 0 && action === 'add') {
         console.log(chalk.gray('  (nothing pasted — keeping existing)'));
@@ -417,7 +557,7 @@ async function setupWallets(mode: Mode): Promise<WalletSources> {
 }
 
 function makeSources(mode: Mode, seedsFile: string, privkeysFile: string): WalletSources {
-  const isEvmMode = mode === 'evm-scan' || mode === 'evm-real';
+  const isEvmMode = mode === 'evm-scan' || mode === 'evm-real' || mode === 'evm-ultra';
   const sources: WalletSources = {};
   if (countNonEmptyLines(seedsFile) > 0) sources.seedsFile = seedsFile;
   if (countNonEmptyLines(privkeysFile) > 0) {
@@ -437,7 +577,7 @@ function makeSources(mode: Mode, seedsFile: string, privkeysFile: string): Walle
 // ---------------------------------------------------------------------------
 async function setupRecipients(mode: Mode): Promise<string | null> {
   if (mode === 'evm-scan' || mode === 'sol-scan') return null;
-  const isEvm = mode === 'evm-real';
+  const isEvm = mode === 'evm-real' || mode === 'evm-ultra';
   const file = isEvm ? RECIPIENTS_EVM_FILE : RECIPIENTS_SOL_FILE;
   const existing = countNonEmptyLines(file);
 
@@ -450,7 +590,7 @@ async function setupRecipients(mode: Mode): Promise<string | null> {
     ),
   );
 
-  type Action = 'use' | 'generate' | 'replace' | 'add' | 'paste';
+  type Action = 'use' | 'generate' | 'replace' | 'add' | 'paste' | 'paste-replace';
   let action: Action;
   if (existing > 0) {
     const a = await prompts({
@@ -461,7 +601,8 @@ async function setupRecipients(mode: Mode): Promise<string | null> {
         { title: 'Use existing', value: 'use' },
         { title: 'Generate fresh wallets (append)', value: 'add' },
         { title: 'Generate fresh wallets (replace)', value: 'replace' },
-        { title: 'Paste recipient addresses', value: 'paste' },
+        { title: 'Paste recipient addresses (append)', value: 'paste' },
+        { title: 'Paste recipient addresses (replace)', value: 'paste-replace' },
       ],
     });
     if (!a.a) throw new Error('cancelled');
@@ -534,6 +675,9 @@ async function setupRecipients(mode: Mode): Promise<string | null> {
       }
     }
 
+    // If the Solana fall-through above re-assigned action to 'paste', skip
+    // the generator and let the paste branch handle it. (paste-replace can't
+    // be reached from here — it's only chosen on the initial select.)
     if (action !== 'paste') {
       if (action === 'replace') {
         // Truncate the recipient list file so the generator's append starts
@@ -575,12 +719,21 @@ async function setupRecipients(mode: Mode): Promise<string | null> {
     const valid = await validateBatch(lines, validator, 'addresses');
     if (valid === null) throw new Error('cancelled');
     if (valid.length === 0) continue;
-    if (existing === 0) {
+    // Replace when the user explicitly picked "(replace)" OR when there's
+    // nothing on disk yet (in which case append/replace are equivalent and
+    // we still want the header banner).
+    const replaceList = action === 'paste-replace' || existing === 0;
+    if (replaceList) {
       writeFresh(file, valid, `# Wizard ${new Date().toISOString()}\n\n`);
     } else {
       appendBlock(file, valid);
     }
-    console.log(chalk.green(`  Saved ${valid.length} recipients to ${path.basename(file)}.`));
+    console.log(
+      chalk.green(
+        `  ${replaceList && existing > 0 ? 'Replaced' : 'Saved'} ${valid.length} recipient${valid.length === 1 ? '' : 's'} ` +
+          `${replaceList && existing > 0 ? 'in' : 'to'} ${path.basename(file)}.`,
+      ),
+    );
     return file;
   }
 }
@@ -634,9 +787,11 @@ async function setupFunder(mode: Mode): Promise<string[]> {
 
 async function collectAndSaveFunders(file: string, isSol: boolean, replace: boolean): Promise<string[]> {
   while (true) {
-    const lines = await readUntilBlank(
+    const rawLines = await readUntilBlank(
       `Paste funder private keys (${isSol ? 'Solana base58/JSON' : 'EVM hex'}):`,
     );
+    // Recover from terminals that strip newlines on paste.
+    const lines = expandStuckPaste(rawLines);
     if (lines.length === 0) {
       console.log(chalk.gray('  (no funders entered)'));
       return [];
@@ -677,6 +832,122 @@ async function askConcurrency(mode: Mode): Promise<number> {
     max: 16,
   });
   return (a.n as number) ?? 2;
+}
+
+// ---------------------------------------------------------------------------
+// ULTRA-specific steps: sybil warning + hub-wallet setup. Only invoked when
+// the user picks the ULTRA mode. The warning is mandatory (cancel = back to
+// menu) and the hub step generates/loads a BIP39 wallet whose mnemonic is
+// persisted to data/hub-<ts>.txt.
+// ---------------------------------------------------------------------------
+
+const ULTRA_SYBIL_WARNING = chalk.yellow.bold(
+  '\n  ⚠  WARNING — ULTRA mode links all your wallets on-chain (Sybil)\n\n',
+) + chalk.yellow(
+  '  In this mode, dust from every source wallet is first swept onto a\n' +
+    '  single hub wallet on each chain, and only then consolidated to ETH\n' +
+    '  and sent to your recipients. As a result, the hub address becomes a\n' +
+    '  common counterparty for ALL your source wallets — anyone analysing\n' +
+    '  on-chain data can cluster them together as belonging to one entity.\n\n' +
+    '  If wallet unlinkability matters to you (e.g. you farm airdrops across\n' +
+    '  these wallets and want them to look independent), pick the standard\n' +
+    '  EVM normal mode instead — it processes each wallet end-to-end without\n' +
+    '  ever crossing paths.\n\n' +
+    '  ULTRA\'s tradeoff: you give up unlinkability to recover dust that\'s\n' +
+    '  too small to swap profitably per-wallet.',
+);
+
+// Show the Sybil warning, ask explicit y/N. Returns false on decline / cancel.
+async function confirmUltraSybil(): Promise<boolean> {
+  console.log(ULTRA_SYBIL_WARNING);
+  const a = await prompts({
+    type: 'confirm',
+    name: 'go',
+    message: 'Proceed with ULTRA?',
+    initial: false,
+  });
+  return !!a.go;
+}
+
+// Pick or create the hub wallet for this ULTRA run. Returns null if the user
+// cancels.
+async function setupHubWallet(): Promise<HubWallet | null> {
+  console.log(chalk.bold('\n== Hub wallet =='));
+  console.log(
+    chalk.gray(
+      '  The hub is a single wallet that aggregates dust from every source\n' +
+        '  before consolidating to ETH on the destination chain. Mnemonic is\n' +
+        '  saved to data/hub-<timestamp>.txt — keep that file safe, the hub\n' +
+        '  may briefly hold the combined value of your dust mid-run.',
+    ),
+  );
+
+  const existing = listExistingHubs(DATA_DIR);
+  type Action = 'use' | 'pick' | 'new';
+  let action: Action;
+  if (existing.length === 0) {
+    console.log(chalk.gray('  No hub files found — a new one will be generated.'));
+    action = 'new';
+  } else {
+    const choices: { title: string; value: Action }[] = [
+      {
+        title: `Reuse most recent hub (${existing[0].evmAddress} — ${existing[0].basename})`,
+        value: 'use',
+      },
+    ];
+    if (existing.length > 1) {
+      choices.push({ title: `Pick a different existing hub (${existing.length} files)`, value: 'pick' });
+    }
+    choices.push({ title: 'Generate a fresh hub wallet', value: 'new' });
+    const a = await prompts({
+      type: 'select',
+      name: 'a',
+      message: 'Hub wallet',
+      choices,
+    });
+    if (!a.a) return null;
+    action = a.a;
+  }
+
+  if (action === 'use') {
+    try {
+      return loadHubFromFile(existing[0].file);
+    } catch (e: any) {
+      log.err(`Failed to load hub ${existing[0].basename}: ${e.message}`);
+      return null;
+    }
+  }
+
+  if (action === 'pick') {
+    const a = await prompts({
+      type: 'select',
+      name: 'i',
+      message: 'Pick a hub',
+      choices: existing.map((h, i) => ({
+        title: `${h.evmAddress}  (${h.basename})`,
+        value: i,
+      })),
+    });
+    if (a.i === undefined) return null;
+    try {
+      return loadHubFromFile(existing[a.i as number].file);
+    } catch (e: any) {
+      log.err(`Failed to load hub: ${e.message}`);
+      return null;
+    }
+  }
+
+  // action === 'new'
+  const hub = generateHub(DATA_DIR);
+  console.log(chalk.green(`  Generated hub wallet ${hub.evm.address}`));
+  console.log(
+    chalk.yellow.bold(
+      `  ⚠ SAVE THIS FILE: ${hub.file}\n` +
+        `  Mnemonic is NOT regenerated. Lose the file = lose access to whatever\n` +
+        `  the hub still holds after a run.`,
+    ),
+  );
+  return hub;
 }
 
 // ---------------------------------------------------------------------------
@@ -961,9 +1232,10 @@ export async function runWizard(): Promise<void> {
         message: 'Choose mode',
         choices: [
           { title: 'EVM scan (read-only, 17 chains)', value: 'evm-scan' },
-          { title: 'EVM real (sweep dust → Arbitrum/Base, 10% dev fee)', value: 'evm-real' },
+          { title: 'EVM normal (sweep dust → Arbitrum/Base, 10% dev fee)', value: 'evm-real' },
+          { title: 'EVM ULTRA sweep (hub-aggregate → Arbitrum/Base, captures sub-gas dust, 10% dev fee — Sybil link)', value: 'evm-ultra' },
           { title: 'Solana scan (read-only)', value: 'sol-scan' },
-          { title: 'Solana real (sweep SPL → SOL, 10% dev fee)', value: 'sol-real' },
+          { title: 'Solana normal (sweep SPL → SOL, 10% dev fee)', value: 'sol-real' },
           { title: 'Manage custom EVM tokens (add/remove your own ERC20 contracts)', value: 'manage-tokens' },
           { title: 'Exit', value: 'exit' },
         ],
@@ -984,6 +1256,17 @@ export async function runWizard(): Promise<void> {
     // ---- One run-mode iteration ----------------------------------------
     // Cancellations from any setup step return to the main menu, NOT exit
     // the whole wizard. Same for run-time errors in the dispatched flow.
+
+    // ULTRA: mandatory Sybil warning + explicit confirm BEFORE we walk the
+    // user through the (longer) ULTRA setup steps. Decline = back to menu.
+    if (mode === 'evm-ultra') {
+      const ok = await confirmUltraSybil();
+      if (!ok) {
+        console.log(ABORT_MSG);
+        console.log(chalk.gray('Returning to main menu.\n'));
+        continue mainMenu;
+      }
+    }
 
     const concurrency = await askConcurrency(mode);
     if (concurrency && concurrency !== Number(process.env.CONCURRENCY || '2')) {
@@ -1027,9 +1310,28 @@ export async function runWizard(): Promise<void> {
       continue mainMenu;
     }
 
+    // ULTRA-only: hub wallet (BIP39, controlled by us). Always after the
+    // funder step so the funder list is locked when the hub address is
+    // shown in the final summary.
+    let ultraHub: HubWallet | null = null;
+    if (mode === 'evm-ultra') {
+      try {
+        ultraHub = await setupHubWallet();
+      } catch (e: any) {
+        log.err(e.message);
+        console.log(chalk.gray('Returning to main menu.\n'));
+        continue mainMenu;
+      }
+      if (!ultraHub) {
+        console.log(ABORT_MSG);
+        console.log(chalk.gray('Returning to main menu.\n'));
+        continue mainMenu;
+      }
+    }
+
     // Final summary, with a preview of the first few derived addresses so
     // the user spots any chain/format mismatch BEFORE we start hitting RPCs.
-    const isEvmMode = mode === 'evm-scan' || mode === 'evm-real';
+    const isEvmMode = mode === 'evm-scan' || mode === 'evm-real' || mode === 'evm-ultra';
     console.log(chalk.bold('\n== Summary =='));
     console.log(`  Mode:        ${chalk.cyan(mode)}`);
     console.log(`  Concurrency: ${concurrency}`);
@@ -1065,6 +1367,10 @@ export async function runWizard(): Promise<void> {
       console.log(`  Recipients:  ${countNonEmptyLines(recipientsFile)} in ${path.basename(recipientsFile)}`);
     }
     console.log(`  Funder:      ${funderKeys.length > 0 ? `${funderKeys.length} key(s)` : chalk.gray('disabled')}`);
+    if (ultraHub) {
+      console.log(`  Hub (EVM):   ${chalk.magenta(ultraHub.evm.address)}`);
+      console.log(chalk.gray(`               mnemonic file: ${path.basename(ultraHub.file)}`));
+    }
     const go = await prompts({ type: 'confirm', name: 'go', message: 'Proceed?', initial: true });
     if (!go.go) {
       console.log(ABORT_MSG);
@@ -1081,6 +1387,14 @@ export async function runWizard(): Promise<void> {
           break;
         case 'evm-real':
           await runEvmMode({ sources, recipientsFile: recipientsFile!, funderKeys });
+          break;
+        case 'evm-ultra':
+          await runEvmUltraMode({
+            sources,
+            recipientsFile: recipientsFile!,
+            funderKeys,
+            hub: ultraHub!,
+          });
           break;
         case 'sol-scan':
           await runSolanaScan({ sources });

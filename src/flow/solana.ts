@@ -19,6 +19,7 @@ import { log } from '../utils/logger';
 import { retry, shuffle, pickRandom, sleep } from '../utils/retry';
 import { getUsdPrice } from '../utils/prices';
 import { getDevDestinations, splitAmount, FEE_BPS } from '../fee/devSplit';
+import { checkPause } from '../utils/pause';
 
 const SOL_MINT = 'So11111111111111111111111111111111111111112'; // wrapped SOL mint
 // Jupiter deprecated `quote-api.jup.ag/v6/*` (returns "fetch failed" / DNS
@@ -755,6 +756,8 @@ export async function runSolanaMode(opts: {
   // burst cap; ignored if RPC_SOLANA is a paid endpoint (cap is much higher).
   const summaries: SolSummary[] = [];
   for (let i = 0; i < assignment.length; i++) {
+    // Cooperative pause checkpoint — Ctrl+C stalls Phase 1 here.
+    await checkPause();
     const a = assignment[i];
     try {
       summaries.push(
@@ -929,6 +932,8 @@ export async function runSolanaScan(opts: { sources: WalletSources }): Promise<v
   const quoteTokens = (process.env.SOLANA_SCAN_QUOTES || '1') !== '0';
 
   for (let i = 0; i < wallets.length; i++) {
+    // Cooperative pause checkpoint — Ctrl+C stalls scan loop here.
+    await checkPause();
     const w = wallets[i];
     console.log(chalk.bold(`\nWallet ${i + 1}/${wallets.length}: ${w.address}`));
 

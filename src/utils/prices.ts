@@ -6,7 +6,21 @@ import { log } from './logger';
 // Cached in-memory for the lifetime of the run.
 
 const CACHE = new Map<string, { v: number; t: number }>();
-const TTL_MS = 5 * 60 * 1000;
+// Positive cache TTL: 30 min. Native prices drift slowly; over a single sweep
+// session (typically a few minutes to an hour) one fetch per coin is plenty.
+// Longer than the old 5 min so concurrent sweeps don't all miss on cold cache.
+const TTL_MS = 30 * 60 * 1000;
+// Negative cache: when CoinGecko rate-limits us (429) or otherwise fails, we
+// pin "null for this id" for 90s so multiple parallel sweepers don't keep
+// hammering the same blocked endpoint and spamming the log. 90s aligns with
+// CoinGecko's published free-tier reset window.
+const NEG_CACHE = new Map<string, number>(); // id -> earliest retry timestamp
+const NEG_TTL_MS = 90 * 1000;
+// In-flight request coalescing: when N concurrent callers want the same id
+// they share a single fetch instead of firing N parallel requests. This was
+// the root cause of the "binancecoin/avalanche-2/fantom 429 × 4" log spam —
+// concurrency=4 fired 4 simultaneous identical requests every time.
+const IN_FLIGHT = new Map<string, Promise<number | null>>();
 
 export async function getUsdPrice(coingeckoId: string): Promise<number> {
   const v = await getUsdPriceOrNull(coingeckoId);
@@ -21,31 +35,46 @@ export async function getUsdPriceOrNull(coingeckoId: string): Promise<number | n
   const hit = CACHE.get(coingeckoId);
   if (hit && Date.now() - hit.t < TTL_MS) return hit.v;
 
+  const negUntil = NEG_CACHE.get(coingeckoId);
+  if (negUntil && Date.now() < negUntil) return null;
+
+  const inflight = IN_FLIGHT.get(coingeckoId);
+  if (inflight) return inflight;
+
   const url = `https://api.coingecko.com/api/v3/simple/price?ids=${encodeURIComponent(
     coingeckoId,
   )}&vs_currencies=usd`;
-  try {
-    const v = await retry(
-      async () => {
-        const res = await withTimeout(
-          fetch(url, { headers: { accept: 'application/json' } }),
-          10_000,
-          'coingecko',
-        );
-        if (!res.ok) throw new Error(`coingecko ${res.status}`);
-        const j: any = await res.json();
-        const p = j?.[coingeckoId]?.usd;
-        if (typeof p !== 'number') throw new Error(`coingecko: no price for ${coingeckoId}`);
-        return p;
-      },
-      { attempts: 2, baseMs: 600 },
-    );
-    CACHE.set(coingeckoId, { v, t: Date.now() });
-    return v;
-  } catch (e: any) {
-    log.warn(`prices: ${coingeckoId} unavailable (${e.message})`);
-    return null;
-  }
+  const promise = (async () => {
+    try {
+      const v = await retry(
+        async () => {
+          const res = await withTimeout(
+            fetch(url, { headers: { accept: 'application/json' } }),
+            10_000,
+            'coingecko',
+          );
+          if (!res.ok) throw new Error(`coingecko ${res.status}`);
+          const j: any = await res.json();
+          const p = j?.[coingeckoId]?.usd;
+          if (typeof p !== 'number') throw new Error(`coingecko: no price for ${coingeckoId}`);
+          return p;
+        },
+        { attempts: 2, baseMs: 600 },
+      );
+      CACHE.set(coingeckoId, { v, t: Date.now() });
+      NEG_CACHE.delete(coingeckoId);
+      return v;
+    } catch (e: any) {
+      // One warning per (id, ~negative-window) is enough.
+      log.warn(`prices: ${coingeckoId} unavailable (${e.message})`);
+      NEG_CACHE.set(coingeckoId, Date.now() + NEG_TTL_MS);
+      return null;
+    } finally {
+      IN_FLIGHT.delete(coingeckoId);
+    }
+  })();
+  IN_FLIGHT.set(coingeckoId, promise);
+  return promise;
 }
 
 // CoinGecko "asset platform" IDs, keyed by our ChainKey. Used by the

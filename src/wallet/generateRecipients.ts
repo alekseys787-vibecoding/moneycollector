@@ -1,6 +1,7 @@
 import * as bip39 from 'bip39';
 import fs from 'fs';
 import path from 'path';
+import { EOL } from 'os';
 import { deriveEvm, deriveSolana } from './derive';
 
 export interface GeneratedRecipient {
@@ -74,17 +75,19 @@ export function generateRecipientWallets(
   const rows = recipients.map(
     (r) => `${r.index} | ${r.mnemonic} | ${r.evmAddress} | ${r.solAddress}`,
   );
-  fs.writeFileSync(keysFile, header.concat(rows).join('\n') + '\n', 'utf8');
+  // os.EOL (CRLF on Windows) so the user can paste this file's contents back
+  // into the wizard without line-merge issues — see appendListFile note.
+  fs.writeFileSync(keysFile, header.concat(rows).join(EOL) + EOL, 'utf8');
 
   const evmListFile = path.join(dataDir, 'recipients-evm.txt');
   const solListFile = path.join(dataDir, 'recipients-sol.txt');
 
   if (opts.onlyChain !== 'sol') {
-    const evmBlock = recipients.map((r) => r.evmAddress).join('\n') + '\n';
+    const evmBlock = recipients.map((r) => r.evmAddress).join(EOL) + EOL;
     appendListFile(evmListFile, evmBlock);
   }
   if (opts.onlyChain !== 'evm') {
-    const solBlock = recipients.map((r) => r.solAddress).join('\n') + '\n';
+    const solBlock = recipients.map((r) => r.solAddress).join(EOL) + EOL;
     appendListFile(solListFile, solBlock);
   }
 
@@ -92,12 +95,14 @@ export function generateRecipientWallets(
 }
 
 // Append a block of lines to a list file. Ensures the existing content (if any)
-// ends with a newline so addresses don't get glued onto a prior line.
+// ends with a newline so addresses don't get glued onto a prior line. Uses
+// os.EOL: LF-only files on Windows have caused paste-into-terminal to merge
+// lines when the user copies the file back later.
 function appendListFile(file: string, block: string): void {
   if (fs.existsSync(file)) {
     const existing = fs.readFileSync(file, 'utf8');
     if (existing.length > 0 && !existing.endsWith('\n')) {
-      fs.appendFileSync(file, '\n');
+      fs.appendFileSync(file, EOL);
     }
   }
   fs.appendFileSync(file, block, 'utf8');

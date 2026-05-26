@@ -72,7 +72,24 @@ export async function lifiQuote(p: LifiQuoteParams): Promise<LifiQuote> {
       );
       const j = (await res.json()) as LifiQuote & { message?: string };
       if (!res.ok) {
-        throw new Error(`LI.FI /quote ${res.status}: ${j?.message || 'unknown'}`);
+        const lifiMsg = j?.message || 'unknown';
+        // LI.FI returns these JSON-schema 400s when fromChain (or toChain) is
+        // not in its supported-list. The common late-2025/2026 case is Fantom
+        // (chainId 250): liquidity migrated to Sonic and LI.FI silently
+        // dropped Fantom from `fromChain` enum. Catch & re-throw with a clean
+        // message so the per-token skip log line is human-readable instead of
+        // dumping the JSON-schema validator output ("must be equal to one of
+        // the allowed values / must match exactly one schema in oneOf").
+        if (
+          /from(Chain|Token)|to(Chain|Token)/i.test(lifiMsg) &&
+          /(allowed values|match exactly one schema)/i.test(lifiMsg)
+        ) {
+          throw new Error(
+            'no bridge route — LI.FI currently does not support this chain pair ' +
+              '(token stays in place)',
+          );
+        }
+        throw new Error(`LI.FI /quote ${res.status}: ${lifiMsg}`);
       }
       if (!j.transactionRequest) throw new Error('LI.FI /quote returned no transactionRequest');
       return j;

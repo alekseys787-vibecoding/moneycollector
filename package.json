@@ -1,6 +1,6 @@
 {
   "name": "moneycollector",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Dust collector across EVM L1/L2s and Solana. Interactive wizard sweeps small balances, swaps to native via Relay.link / LI.FI / Jupiter, splits 90% to user recipients / 10% to dev fee.",
   "main": "dist/index.js",
