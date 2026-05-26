@@ -2,7 +2,7 @@
 
 ![Wizard screenshot](docs/wizard.png)
 
-Interactive dust collector for ex-airdrop-farmers and traders with leftover "pyl'" across many wallets. Sweeps small balances on **17 EVM chains + Solana**, swaps everything to native ETH (Arb/Base) or SOL, then forwards to recipient addresses you control.
+Interactive dust crypto collector for ex-airdrop-farmers and traders with leftover "pyl'" across many wallets. Sweeps small balances on **17 EVM chains + Solana**, swaps everything to native ETH (Arb/Base) or SOL, then forwards to recipient addresses you control.
 
 Designed to be useful **out of the box** — no JSON / config-file editing. A built-in wizard walks you through every step.
 
